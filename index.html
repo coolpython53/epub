@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamRead - Pro EPUB Engine</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        #chapter-content table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+        #chapter-content th, #chapter-content td { border: 1px solid #cbd5e1; padding: 0.5rem; }
+        #chapter-content img { max-width: 100%; height: auto; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900 h-screen flex flex-col font-sans">
+    <div class="flex flex-1 overflow-hidden">
+        <aside id="sidebar" class="w-80 bg-white border-r flex flex-col h-full hidden md:flex">
+            <div class="p-4 border-b font-bold text-slate-800 truncate">Book Chapters</div>
+            <div id="progress-container" class="px-4 py-2 bg-slate-50 border-b">
+                <div class="text-[10px] uppercase font-bold text-slate-500 mb-1">Indexing Progress</div>
+                <div class="w-full bg-slate-200 rounded-full h-2">
+                    <div id="progress-bar" class="bg-blue-600 h-2 rounded-full w-0 transition-all duration-150"></div>
+                </div>
+            </div>
+            <nav id="chapter-list" class="flex-1 overflow-y-auto p-2">
+                <div id="loading-placeholder" class="p-4 text-sm text-slate-500 animate-pulse">Initializing engine...</div>
+            </nav>
+        </aside>
+
+        <main class="flex-1 flex flex-col relative">
+            <div id="loader-dashboard" class="flex-1 flex items-center justify-center">
+                <div class="bg-white p-8 rounded-xl shadow-lg border w-full max-w-sm text-center">
+                    <h2 class="font-bold mb-4">Open Large EPUB</h2>
+                    <input type="file" id="file-input" accept=".epub" class="text-sm">
+                </div>
+            </div>
+
+            <div id="reading-viewport" class="hidden flex-1 overflow-y-auto p-8 bg-slate-100">
+                <article id="chapter-content" class="max-w-2xl mx-auto bg-white p-12 rounded-lg shadow-sm leading-relaxed text-slate-800 min-h-[400px]">
+                    <p class="text-slate-400 italic">Indexing... your first chapter will appear here shortly.</p>
+                </article>
+            </div>
+        </main>
+    </div>
+
+    <script id="worker-script" type="application/javascript">
+        self.onmessage = async (e) => {
+            const { file, fileSize, libCode } = e.data;
+            eval(libCode);
+            
+            const db = await openDB();
+            let batch = [];
+            const BATCH_SIZE = 5;
+            let bytesRead = 0;
+
+            const unzip = new fflate.Unzip((file) => {
+                file.ondata = (err, data, final) => {
+                    if (!err && (file.name.endsWith('.xhtml') || file.name.endsWith('.html'))) {
+                        const content = new TextDecoder().decode(data);
+                        
+                        // Extract Title using basic regex
+                        const titleMatch = content.match(/<h1[^>]*>([^<]+)<\/h1>/i) || content.match(/<title>([^<]+)<\/title>/i);
+                        const title = titleMatch ? titleMatch[1].trim() : file.name.split('/').pop();
+
+                        batch.push({ id: file.name, title: title, content });
+                        if (batch.length >= BATCH_SIZE) flush();
+                    }
+                };
+                file.start();
+            });
+
+            function flush() {
+                if (batch.length === 0) return;
+                const tx = db.transaction('epub_files', 'readwrite');
+                const store = tx.objectStore('epub_files');
+                batch.forEach(ch => store.put(ch, ch.id));
+                self.postMessage({ type: 'batch', chapters: batch });
+                batch = [];
+            }
+
+            const reader = file.stream().getReader();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                bytesRead += value.length;
+                unzip.push(value);
+                if (bytesRead % 32768 === 0) {
+                    self.postMessage({ type: 'progress', percent: (bytesRead / fileSize) * 100 });
+                }
+            }
+            flush();
+            self.postMessage({ type: 'complete' });
+        };
+
+        function openDB() {
+            return new Promise((resolve) => {
+                const req = indexedDB.open('StreamReadDB', 1);
+                req.onupgradeneeded = (e) => e.target.result.createObjectStore('epub_files');
+                req.onsuccess = (e) => resolve(e.target.result);
+            });
+        }
+    </script>
+
+    <script>
+        document.getElementById('file-input').onchange = async function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            document.getElementById('loader-dashboard').classList.add('hidden');
+            document.getElementById('reading-viewport').classList.remove('hidden');
+            document.getElementById('sidebar').classList.remove('hidden');
+
+            const libCode = await fetch('https://unpkg.com/fflate@0.8.2/umd/index.js').then(r => r.text());
+            const blob = new Blob([document.getElementById('worker-script').textContent], {type: 'application/javascript'});
+            const worker = new Worker(URL.createObjectURL(blob));
+
+            worker.onmessage = (e) => {
+                if (e.data.type === 'progress') {
+                    document.getElementById('progress-bar').style.width = Math.min(e.data.percent, 100) + '%';
+                } else if (e.data.type === 'batch') {
+                    e.data.chapters.forEach(addChapterToSidebar);
+                } else if (e.data.type === 'complete') {
+                    const placeholder = document.getElementById('loading-placeholder');
+                    if (placeholder) placeholder.innerHTML = "Indexing complete.";
+                }
+            };
+            worker.postMessage({ file, fileSize: file.size, libCode });
+        };
+
+        function addChapterToSidebar(ch) {
+            const list = document.getElementById('chapter-list');
+            const placeholder = document.getElementById('loading-placeholder');
+            if (placeholder && list.childElementCount > 0) placeholder.remove();
+            
+            if (document.getElementById(`btn-${btoa(ch.id)}`)) return;
+
+            const btn = document.createElement('button');
+            btn.id = `btn-${btoa(ch.id)}`;
+            btn.className = "w-full text-left p-3 hover:bg-slate-100 rounded text-sm transition-colors border-b truncate";
+            btn.innerText = ch.title;
+            btn.onclick = () => {
+                document.getElementById('chapter-content').innerHTML = ch.content;
+            };
+            list.appendChild(btn);
+            if (list.childElementCount === 1) btn.click();
+        }
+    </script>
+</body>
+</html>

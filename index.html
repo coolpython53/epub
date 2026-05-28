@@ -30,7 +30,7 @@
             <div id="loader-dashboard" class="flex-1 flex items-center justify-center">
                 <div class="bg-white p-8 rounded-xl shadow-lg border w-full max-w-sm text-center">
                     <h2 class="font-bold mb-4">Open Large EPUB</h2>
-                    <input type="file" id="file-input" accept=".epub" class="text-sm">
+                    <input type="file" id="file-input" accept=".epub" class="text-sm mx-auto">
                 </div>
             </div>
 
@@ -46,18 +46,16 @@
         </main>
     </div>
 
+    <!-- The worker code is now entirely self-contained and avoids eval/new Function -->
     <script id="worker-script" type="application/javascript">
-        // This is a placeholder that will be replaced with actual library code
-        // and initialized before processing the EPUB file
         self.onmessage = async (e) => {
-            const { file, fileSize, libSource } = e.data;
-            eval(libSource); // Safe inside worker scope if fetched content is trusted
-            
+            const { file, fileSize } = e.data;
             const db = await openDB();
             let batch = [];
             const BATCH_SIZE = 5;
             let bytesRead = 0;
 
+            // fflate is globally available here because the library is prepended in the main thread
             const unzip = new fflate.Unzip((file) => {
                 file.ondata = (err, data, final) => {
                     if (err) return;
@@ -100,7 +98,7 @@
 
         function openDB() {
             return new Promise((resolve) => {
-                const req = indexedDB.open('StreamReadDB', 7);
+                const req = indexedDB.open('StreamReadDB', 8);
                 req.onupgradeneeded = (e) => e.target.result.createObjectStore('epub_files');
                 req.onsuccess = (e) => resolve(e.target.result);
             });
@@ -110,6 +108,7 @@
     <script>
         let currentChapterIndex = 0;
         const chapters = [];
+        const allFileKeys = new Set(); // Fast in-memory cache of stored file keys
 
         document.getElementById('file-input').onchange = async function(e) {
             const file = e.target.files[0];
@@ -118,22 +117,46 @@
             document.getElementById('loader-dashboard').classList.add('hidden');
             document.getElementById('reading-viewport').classList.remove('hidden');
             document.getElementById('sidebar').classList.remove('hidden');
+            document.getElementById('loading-placeholder').innerHTML = "Initializing extraction pipeline...";
 
-            const libSource = await fetch('https://unpkg.com/fflate@0.8.2/umd/index.js').then(r => r.text());
-            
-            const blob = new Blob([document.getElementById('worker-script').textContent], {type: 'application/javascript'});
-            const worker = new Worker(URL.createObjectURL(blob));
+            try {
+                // Fetch fflate and combine it directly with the worker script
+                const fflateResponse = await fetch('https://unpkg.com/fflate@0.8.2/umd/index.js');
+                if (!fflateResponse.ok) throw new Error("Could not fetch dependency fflate library.");
+                const fflateScript = await fflateResponse.text();
+                
+                const workerScriptElement = document.getElementById('worker-script');
+                const combinedCode = fflateScript + "\n" + workerScriptElement.textContent;
 
-            worker.onmessage = (e) => {
-                if (e.data.type === 'progress') {
-                    document.getElementById('progress-bar').style.width = Math.min(e.data.percent, 100) + '%';
-                } else if (e.data.type === 'batch') {
-                    e.data.items.filter(i => i.type === 'text').forEach(addChapterToSidebar);
-                } else if (e.data.type === 'complete') {
-                    document.getElementById('loading-placeholder').innerHTML = "Indexing complete.";
-                }
-            };
-            worker.postMessage({ file, fileSize: file.size, libSource });
+                const blob = new Blob([combinedCode], {type: 'application/javascript'});
+                const worker = new Worker(URL.createObjectURL(blob));
+
+                worker.onerror = (err) => {
+                    console.error("Worker Startup Error:", err);
+                    document.getElementById('loading-placeholder').innerHTML = "Worker Crash: " + err.message;
+                };
+
+                worker.onmessage = (e) => {
+                    if (e.data.type === 'progress') {
+                        document.getElementById('progress-bar').style.width = Math.min(e.data.percent, 100) + '%';
+                    } else if (e.data.type === 'batch') {
+                        // Track keys for fast in-memory media resolution
+                        e.data.items.forEach(item => allFileKeys.add(item.id));
+                        
+                        // Add textual chapters to sidebar
+                        e.data.items.filter(i => i.type === 'text').forEach(addChapterToSidebar);
+                    } else if (e.data.type === 'complete') {
+                        const placeholder = document.getElementById('loading-placeholder');
+                        if (placeholder) placeholder.innerHTML = "Indexing complete.";
+                    }
+                };
+
+                worker.postMessage({ file, fileSize: file.size });
+
+            } catch (error) {
+                console.error("Initialization failed:", error);
+                document.getElementById('loading-placeholder').innerHTML = "Setup Error: " + error.message;
+            }
         };
 
         async function addChapterToSidebar(ch) {
@@ -156,10 +179,15 @@
             const parser = new DOMParser();
             const doc = parser.parseFromString(ch.content, 'text/html');
             const mediaElements = doc.querySelectorAll('img, video source');
+            
             for (let el of mediaElements) {
-                const blobUrl = await getMediaBlobUrl(el.getAttribute('src'));
-                if (blobUrl) el.setAttribute('src', blobUrl);
+                const src = el.getAttribute('src');
+                if (src) {
+                    const blobUrl = await getMediaBlobUrl(src);
+                    if (blobUrl) el.setAttribute('src', blobUrl);
+                }
             }
+            
             document.getElementById('chapter-content').innerHTML = doc.body.innerHTML;
             document.getElementById('prev-btn').disabled = (index === 0);
             document.getElementById('next-btn').disabled = (index === chapters.length - 1);
@@ -171,28 +199,36 @@
         }
 
         async function getMediaBlobUrl(path) {
+            const cleanPath = path.replace(/(\.\.\/|\.\/)/g, '');
+            
+            // Fast in-memory key resolution
+            let matchedKey = null;
+            for (let key of allFileKeys) {
+                if (key.endsWith(cleanPath)) {
+                    matchedKey = key;
+                    break;
+                }
+            }
+            if (!matchedKey) return null;
+
             const db = await new Promise(r => {
-                const req = indexedDB.open('StreamReadDB', 7);
+                const req = indexedDB.open('StreamReadDB', 8);
                 req.onsuccess = (e) => r(e.target.result);
             });
             const tx = db.transaction('epub_files', 'readonly');
+            const store = tx.objectStore('epub_files');
+
             return new Promise((resolve) => {
-                const store = tx.objectStore('epub_files');
-                const req = store.openCursor();
-                req.onsuccess = (e) => {
-                    const cursor = e.target.result;
-                    if (cursor) {
-                        const cleanPath = path.replace(/(\.\.\/|\.\/)/g, '');
-                        if (cursor.key.endsWith(cleanPath)) {
-                            const blob = new Blob([cursor.value.data]);
-                            resolve(URL.createObjectURL(blob));
-                        } else {
-                            cursor.continue();
-                        }
+                const req = store.get(matchedKey);
+                req.onsuccess = () => {
+                    if (req.result && req.result.data) {
+                        const blob = new Blob([req.result.data]);
+                        resolve(URL.createObjectURL(blob));
                     } else {
                         resolve(null);
                     }
                 };
+                req.onerror = () => resolve(null);
             });
         }
     </script>

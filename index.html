@@ -99,7 +99,12 @@
         function openDB() {
             return new Promise((resolve) => {
                 const req = indexedDB.open('StreamReadDB', 8);
-                req.onupgradeneeded = (e) => e.target.result.createObjectStore('epub_files');
+                req.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains('epub_files')) {
+                        db.createObjectStore('epub_files');
+                    }
+                };
                 req.onsuccess = (e) => resolve(e.target.result);
             });
         }
@@ -213,6 +218,12 @@
 
             const db = await new Promise(r => {
                 const req = indexedDB.open('StreamReadDB', 8);
+                req.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains('epub_files')) {
+                        db.createObjectStore('epub_files');
+                    }
+                };
                 req.onsuccess = (e) => r(e.target.result);
             });
             const tx = db.transaction('epub_files', 'readonly');

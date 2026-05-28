@@ -35,7 +35,6 @@
             </div>
 
             <div id="reading-viewport" class="hidden flex-1 overflow-y-auto p-8 bg-slate-100">
-                <!-- Navigation Header -->
                 <div class="max-w-2xl mx-auto flex justify-between mb-4">
                     <button id="prev-btn" onclick="navigate(-1)" class="bg-white px-4 py-2 rounded-lg shadow-sm border text-sm font-medium hover:bg-slate-50 disabled:opacity-50">Previous</button>
                     <button id="next-btn" onclick="navigate(1)" class="bg-white px-4 py-2 rounded-lg shadow-sm border text-sm font-medium hover:bg-slate-50 disabled:opacity-50">Next</button>
@@ -50,6 +49,7 @@
     <script id="worker-script" type="application/javascript">
         self.onmessage = async (e) => {
             const { file, fileSize, libCode } = e.data;
+            // Inject the library code directly into the worker scope
             eval(libCode);
             
             const db = await openDB();
@@ -99,7 +99,7 @@
 
         function openDB() {
             return new Promise((resolve) => {
-                const req = indexedDB.open('StreamReadDB', 2);
+                const req = indexedDB.open('StreamReadDB', 3);
                 req.onupgradeneeded = (e) => e.target.result.createObjectStore('epub_files');
                 req.onsuccess = (e) => resolve(e.target.result);
             });
@@ -118,7 +118,9 @@
             document.getElementById('reading-viewport').classList.remove('hidden');
             document.getElementById('sidebar').classList.remove('hidden');
 
+            // Fetch fflate library and pass it to the worker as a string
             const libCode = await fetch('https://unpkg.com/fflate@0.8.2/umd/index.js').then(r => r.text());
+            
             const blob = new Blob([document.getElementById('worker-script').textContent], {type: 'application/javascript'});
             const worker = new Worker(URL.createObjectURL(blob));
 
@@ -170,7 +172,7 @@
 
         async function getMediaBlobUrl(path) {
             const db = await new Promise(r => {
-                const req = indexedDB.open('StreamReadDB', 2);
+                const req = indexedDB.open('StreamReadDB', 3);
                 req.onsuccess = (e) => r(e.target.result);
             });
             const tx = db.transaction('epub_files', 'readonly');

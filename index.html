@@ -8,7 +8,7 @@
     <style>
         #chapter-content table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
         #chapter-content th, #chapter-content td { border: 1px solid #cbd5e1; padding: 0.5rem; }
-        #chapter-content img { max-width: 100%; height: auto; }
+        #chapter-content img, #chapter-content video { max-width: 100%; height: auto; display: block; margin: 1rem auto; border-radius: 0.5rem; }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-900 h-screen flex flex-col font-sans">
@@ -35,6 +35,11 @@
             </div>
 
             <div id="reading-viewport" class="hidden flex-1 overflow-y-auto p-8 bg-slate-100">
+                <!-- Navigation Header -->
+                <div class="max-w-2xl mx-auto flex justify-between mb-4">
+                    <button id="prev-btn" onclick="navigate(-1)" class="bg-white px-4 py-2 rounded-lg shadow-sm border text-sm font-medium hover:bg-slate-50 disabled:opacity-50">Previous</button>
+                    <button id="next-btn" onclick="navigate(1)" class="bg-white px-4 py-2 rounded-lg shadow-sm border text-sm font-medium hover:bg-slate-50 disabled:opacity-50">Next</button>
+                </div>
                 <article id="chapter-content" class="max-w-2xl mx-auto bg-white p-12 rounded-lg shadow-sm leading-relaxed text-slate-800 min-h-[400px]">
                     <p class="text-slate-400 italic">Indexing... your first chapter will appear here shortly.</p>
                 </article>
@@ -54,16 +59,17 @@
 
             const unzip = new fflate.Unzip((file) => {
                 file.ondata = (err, data, final) => {
-                    if (!err && (file.name.endsWith('.xhtml') || file.name.endsWith('.html'))) {
+                    if (err) return;
+                    if (file.name.endsWith('.xhtml') || file.name.endsWith('.html')) {
                         const content = new TextDecoder().decode(data);
-                        
-                        // Extract Title using basic regex
+                        if (content.toLowerCase().includes('redirect to:')) return;
                         const titleMatch = content.match(/<h1[^>]*>([^<]+)<\/h1>/i) || content.match(/<title>([^<]+)<\/title>/i);
                         const title = titleMatch ? titleMatch[1].trim() : file.name.split('/').pop();
-
-                        batch.push({ id: file.name, title: title, content });
-                        if (batch.length >= BATCH_SIZE) flush();
+                        batch.push({ type: 'text', id: file.name, title: title, content });
+                    } else if (file.name.match(/\.(mp4|webm|ogv|jpg|jpeg|png|gif|svg)$/i)) {
+                        batch.push({ type: 'media', id: file.name, data });
                     }
+                    if (batch.length >= BATCH_SIZE) flush();
                 };
                 file.start();
             });
@@ -72,8 +78,8 @@
                 if (batch.length === 0) return;
                 const tx = db.transaction('epub_files', 'readwrite');
                 const store = tx.objectStore('epub_files');
-                batch.forEach(ch => store.put(ch, ch.id));
-                self.postMessage({ type: 'batch', chapters: batch });
+                batch.forEach(item => store.put(item, item.id));
+                self.postMessage({ type: 'batch', items: batch });
                 batch = [];
             }
 
@@ -93,7 +99,7 @@
 
         function openDB() {
             return new Promise((resolve) => {
-                const req = indexedDB.open('StreamReadDB', 1);
+                const req = indexedDB.open('StreamReadDB', 2);
                 req.onupgradeneeded = (e) => e.target.result.createObjectStore('epub_files');
                 req.onsuccess = (e) => resolve(e.target.result);
             });
@@ -101,6 +107,9 @@
     </script>
 
     <script>
+        let currentChapterIndex = 0;
+        const chapters = [];
+
         document.getElementById('file-input').onchange = async function(e) {
             const file = e.target.files[0];
             if (!file) return;
@@ -117,31 +126,72 @@
                 if (e.data.type === 'progress') {
                     document.getElementById('progress-bar').style.width = Math.min(e.data.percent, 100) + '%';
                 } else if (e.data.type === 'batch') {
-                    e.data.chapters.forEach(addChapterToSidebar);
+                    e.data.items.filter(i => i.type === 'text').forEach(addChapterToSidebar);
                 } else if (e.data.type === 'complete') {
-                    const placeholder = document.getElementById('loading-placeholder');
-                    if (placeholder) placeholder.innerHTML = "Indexing complete.";
+                    document.getElementById('loading-placeholder').innerHTML = "Indexing complete.";
                 }
             };
             worker.postMessage({ file, fileSize: file.size, libCode });
         };
 
-        function addChapterToSidebar(ch) {
+        async function addChapterToSidebar(ch) {
+            chapters.push(ch);
             const list = document.getElementById('chapter-list');
             const placeholder = document.getElementById('loading-placeholder');
             if (placeholder && list.childElementCount > 0) placeholder.remove();
             
-            if (document.getElementById(`btn-${btoa(ch.id)}`)) return;
-
             const btn = document.createElement('button');
-            btn.id = `btn-${btoa(ch.id)}`;
             btn.className = "w-full text-left p-3 hover:bg-slate-100 rounded text-sm transition-colors border-b truncate";
             btn.innerText = ch.title;
-            btn.onclick = () => {
-                document.getElementById('chapter-content').innerHTML = ch.content;
-            };
+            btn.onclick = () => renderChapter(chapters.length - 1);
             list.appendChild(btn);
-            if (list.childElementCount === 1) btn.click();
+            if (chapters.length === 1) renderChapter(0);
+        }
+
+        async function renderChapter(index) {
+            currentChapterIndex = index;
+            const ch = chapters[index];
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(ch.content, 'text/html');
+            const mediaElements = doc.querySelectorAll('img, video source');
+            for (let el of mediaElements) {
+                const blobUrl = await getMediaBlobUrl(el.getAttribute('src'));
+                if (blobUrl) el.setAttribute('src', blobUrl);
+            }
+            document.getElementById('chapter-content').innerHTML = doc.body.innerHTML;
+            document.getElementById('prev-btn').disabled = (index === 0);
+            document.getElementById('next-btn').disabled = (index === chapters.length - 1);
+        }
+
+        function navigate(dir) {
+            const newIndex = currentChapterIndex + dir;
+            if (newIndex >= 0 && newIndex < chapters.length) renderChapter(newIndex);
+        }
+
+        async function getMediaBlobUrl(path) {
+            const db = await new Promise(r => {
+                const req = indexedDB.open('StreamReadDB', 2);
+                req.onsuccess = (e) => r(e.target.result);
+            });
+            const tx = db.transaction('epub_files', 'readonly');
+            return new Promise((resolve) => {
+                const store = tx.objectStore('epub_files');
+                const req = store.openCursor();
+                req.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        const cleanPath = path.replace(/(\.\.\/|\.\/)/g, '');
+                        if (cursor.key.endsWith(cleanPath)) {
+                            const blob = new Blob([cursor.value.data]);
+                            resolve(URL.createObjectURL(blob));
+                        } else {
+                            cursor.continue();
+                        }
+                    } else {
+                        resolve(null);
+                    }
+                };
+            });
         }
     </script>
 </body>

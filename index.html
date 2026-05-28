@@ -47,16 +47,11 @@
     </div>
 
     <script id="worker-script" type="application/javascript">
-        // Helper to perform the equivalent of importScripts without external network calls
-        async function initWorker() {
-            const libResponse = await fetch('https://unpkg.com/fflate@0.8.2/umd/index.js');
-            const libCode = await libResponse.text();
-            eval(libCode); // Evaluated once in worker startup, allowed in worker context
-        }
-
+        // This is a placeholder that will be replaced with actual library code
+        // and initialized before processing the EPUB file
         self.onmessage = async (e) => {
-            const { file, fileSize } = e.data;
-            await initWorker();
+            const { file, fileSize, libSource } = e.data;
+            eval(libSource); // Safe inside worker scope if fetched content is trusted
             
             const db = await openDB();
             let batch = [];
@@ -105,7 +100,7 @@
 
         function openDB() {
             return new Promise((resolve) => {
-                const req = indexedDB.open('StreamReadDB', 5);
+                const req = indexedDB.open('StreamReadDB', 7);
                 req.onupgradeneeded = (e) => e.target.result.createObjectStore('epub_files');
                 req.onsuccess = (e) => resolve(e.target.result);
             });
@@ -116,7 +111,7 @@
         let currentChapterIndex = 0;
         const chapters = [];
 
-        document.getElementById('file-input').onchange = function(e) {
+        document.getElementById('file-input').onchange = async function(e) {
             const file = e.target.files[0];
             if (!file) return;
 
@@ -124,6 +119,8 @@
             document.getElementById('reading-viewport').classList.remove('hidden');
             document.getElementById('sidebar').classList.remove('hidden');
 
+            const libSource = await fetch('https://unpkg.com/fflate@0.8.2/umd/index.js').then(r => r.text());
+            
             const blob = new Blob([document.getElementById('worker-script').textContent], {type: 'application/javascript'});
             const worker = new Worker(URL.createObjectURL(blob));
 
@@ -136,7 +133,7 @@
                     document.getElementById('loading-placeholder').innerHTML = "Indexing complete.";
                 }
             };
-            worker.postMessage({ file, fileSize: file.size });
+            worker.postMessage({ file, fileSize: file.size, libSource });
         };
 
         async function addChapterToSidebar(ch) {
@@ -175,7 +172,7 @@
 
         async function getMediaBlobUrl(path) {
             const db = await new Promise(r => {
-                const req = indexedDB.open('StreamReadDB', 5);
+                const req = indexedDB.open('StreamReadDB', 7);
                 req.onsuccess = (e) => r(e.target.result);
             });
             const tx = db.transaction('epub_files', 'readonly');
